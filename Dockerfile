@@ -1,68 +1,114 @@
+# =========================
+# Builder
+# =========================
 FROM alpine:3.20 AS builder
 
 WORKDIR /tmp/citra
 
-RUN apk update \
-    && apk -U add --no-cache \
-        build-base \
-        binutils-gold \
-        ca-certificates \
-        cmake \
-        glslang \
-        libstdc++ \
-        linux-headers \
-        ninja-build \
-        openssl-dev \
-        wget \
-        xz \
-    && export PATH=$PATH:/bin:/usr/local/bin:/usr/bin:/sbin:/usr/lib/ninja-build/bin \
-    && mkdir -p /server/lib /tmp/citra/build \
-    && wget --show-progress -q -c -O "citra-unified.tar.xz" "https://github.com/azahar-emu/azahar/releases/download/2121.1/azahar-unified-source-2121.1.tar.xz" \
-    && tar --strip-components=1 -xf citra-unified.tar.xz \
-    && { echo "#!/bin/ash"; \
-         echo "SCRIPT_DIR=/tmp/citra/build"; \
-         echo "cd \$SCRIPT_DIR"; \
-         echo "LDFLAGS=\"-flto -fuse-linker-plugin -fuse-ld=gold\""; \
-         echo "CFLAGS=\"-ftree-vectorize -flto\""; \
-         echo "if [[ \"$(uname -m)\" == \"aarch64\" ]]; then"; \
-         echo "  CFLAGS=\"-O2\""; \
-         echo "  LDFLAGS=\"\""; \
-         echo "elif [[ \"$(uname -m)\" == \"x86_64\" ]]; then"; \
-         echo "  CFLAGS=\"$CFLAGS -march=core2 -mtune=intel\""; \
-         echo "fi"; \
-         echo "export CFLAGS"; \
-         echo "export CXXFLAGS=\"$CFLAGS\""; \
-         echo "export LDFLAGS"; \
-         echo "cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release \\"; \
-         echo " -DENABLE_SDL2=OFF -DENABLE_QT=OFF -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF \\"; \
-         echo " -DUSE_DISCORD_PRESENCE=OFF -DENABLE_FFMPEG_VIDEO_DUMPER=OFF -DUSE_SYSTEM_OPENSSL=ON \\"; \
-         echo " -DCITRA_WARNINGS_AS_ERRORS=OFF -DENABLE_LTO=ON"; \
-         echo "ninja citra_room_standalone "; \
-       } >/tmp/citra/build/build.sh \
-        && chmod +x /tmp/citra/build/build.sh \
-     && /tmp/citra/build/build.sh \
-     && cp /tmp/citra/build/bin/Release/azahar-room /server/azahar-room \
-     && strip /server/azahar-room \
-     && chmod +x /server/azahar-room \
-     && cp /usr/lib/libgcc_s.so.1 /server/lib/libgcc_s.so.1 \
-     && cp /usr/lib/libstdc++.so.6 /server/lib/libstdc++.so.6 \
-     && echo -e "CitraRoom-BanList-1" > /server/bannedlist.cbl \
-     && touch /server/azahar-room.log \
-     && rm -R /tmp/citra
+# Build deps (note: 'ninja' on Alpine). Added: python3, git
+RUN apk add --no-cache \
+      build-base \
+      cmake \
+      ninja \
+      glslang \
+      linux-headers \
+      pkgconf \
+      zlib-dev \
+      openssl-dev \
+      ca-certificates \
+      wget \
+      xz \
+      python3 \
+      git \
+ && update-ca-certificates
 
+# Fetch source (Azahar unified source tarball)
+RUN mkdir -p /server /tmp/citra/build \
+ && wget -q -O citra-unified.tar.xz \
+      "https://github.com/azahar-emu/azahar/releases/download/2123.1/azahar-unified-source-2123.1.tar.xz" \
+ && tar --strip-components=1 -xf citra-unified.tar.xz
 
+# Portable build script (POSIX sh; no bashisms)
+RUN cat > /tmp/citra/build/build.sh <<'SH' \
+ && chmod +x /tmp/citra/build/build.sh \
+ && /tmp/citra/build/build.sh
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=/tmp/citra/build
+mkdir -p "$SCRIPT_DIR"
+cd "$SCRIPT_DIR"
+
+CMAKE_FLAGS="
+  -GNinja
+  -DCMAKE_BUILD_TYPE=Release
+  -DENABLE_SDL2=OFF
+  -DENABLE_QT=OFF
+  -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF
+  -DUSE_DISCORD_PRESENCE=OFF
+  -DENABLE_FFMPEG_VIDEO_DUMPER=OFF
+  -DUSE_SYSTEM_OPENSSL=ON
+  -DCITRA_WARNINGS_AS_ERRORS=OFF
+  -DENABLE_LTO=ON
+"
+
+# Optional arch tuning
+arch="$(uname -m)"
+if [ "$arch" = "aarch64" ]; then
+  export CFLAGS="-O2"
+  export CXXFLAGS="$CFLAGS"
+elif [ "$arch" = "x86_64" ]; then
+  export CFLAGS="-O2 -march=core2 -mtune=intel"
+  export CXXFLAGS="$CFLAGS"
+fi
+
+cmake .. $CMAKE_FLAGS
+
+# Try common targets; fall back as needed
+if ! ninja azahar_room_standalone 2>/dev/null; then
+  if ! ninja citra_room_standalone 2>/dev/null; then
+    ninja
+  fi
+fi
+
+# Locate produced room binary robustly
+BIN_PATH="$(find "$SCRIPT_DIR" -type f \( -name 'azahar-room' -o -name 'citra-room' \) -perm -111 -print -quit)"
+if [ -z "$BIN_PATH" ]; then
+  echo "ERROR: Could not find built room binary (azahar-room/citra-room) under $SCRIPT_DIR" >&2
+  exit 1
+fi
+
+# Normalize name to azahar-room for the final image
+install -Dm755 "$BIN_PATH" /server/azahar-room
+SH
+
+# Keep only artifacts we need for the runtime stage
+RUN install -Dm755 /server/azahar-room /out/azahar-room
+
+# =========================
+# Runtime
+# =========================
 FROM alpine:3.20
+
+# Runtime libs: OpenSSL, libstdc++, libgcc, CA roots
+RUN apk add --no-cache \
+      ca-certificates \
+      openssl \
+      libstdc++ \
+      libgcc \
+ && update-ca-certificates
 
 ENV USERNAME=azahar
 ENV USERHOME=/home/$USERNAME
 
+# -------- Default Room Configuration --------
 # Required
 ENV AZAHAR_PORT=24872
 ENV AZAHAR_ROOMNAME="Azahar Room"
 ENV AZAHAR_PREFGAME="Any"
 ENV AZAHAR_MAXMEMBERS=4
 ENV AZAHAR_BANLISTFILE="bannedlist.cbl"
-ENV AZAHAR_LOGFILE="citra-room.log"
+ENV AZAHAR_LOGFILE="azahar-room.log"
 # Optional
 ENV AZAHAR_ROOMDESC=""
 ENV AZAHAR_PREFGAMEID="0"
@@ -71,16 +117,25 @@ ENV AZAHAR_ISPUBLIC=0
 ENV AZAHAR_TOKEN=""
 ENV AZAHAR_WEBAPIURL=""
 
-RUN apk update \
-    && adduser --disabled-password $USERNAME \
-    && rm -rf /tmp/* /var/tmp/*
+# Create unprivileged user
+RUN adduser -D "$USERNAME"
 
-COPY --from=builder --chown=$USERNAME /server/ $USERHOME/
-COPY --chown=$USERNAME ./container_files/ $USERHOME/
-
-USER $USERNAME
 WORKDIR $USERHOME
 
-RUN chmod +x docker-entrypoint.sh
+# Copy built binary
+COPY --from=builder /out/azahar-room $USERHOME/azahar-room
+
+# Copy container files (entrypoint, etc.)
+# Ensure container_files/docker-entrypoint.sh has a proper #!/bin/sh shebang and is executable.
+COPY ./container_files/ $USERHOME/
+
+# Ensure files/permissions
+RUN chmod +x $USERHOME/azahar-room \
+ && chmod +x $USERHOME/docker-entrypoint.sh \
+ && touch $USERHOME/$AZAHAR_LOGFILE \
+ && [ -f "$USERHOME/$AZAHAR_BANLISTFILE" ] || echo "CitraRoom-BanList-1" > "$USERHOME/$AZAHAR_BANLISTFILE" \
+ && chown -R $USERNAME:$USERNAME $USERHOME
+
+USER $USERNAME
 
 ENTRYPOINT ["./docker-entrypoint.sh"]
